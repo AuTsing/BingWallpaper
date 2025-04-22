@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 tray-icon = "0.20.1"
 winit = "0.30.9"
+windows = { version = "0.61.1", features = ["Win32_UI_WindowsAndMessaging"] }
+reqwest = { version = "0.12.15", features = ["blocking", "json"] }
+tempfile = "3.19.1"
+serde = "1.0.219"

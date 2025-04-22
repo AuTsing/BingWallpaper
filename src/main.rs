@@ -1,3 +1,9 @@
+use serde::Deserialize;
+use std::ffi::OsStr;
+use std::io::BufWriter;
+use std::io::copy;
+use std::os::windows::ffi::OsStrExt;
+use tempfile::Builder;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
@@ -6,6 +12,10 @@ use tray_icon::menu::Menu;
 use tray_icon::menu::MenuEvent;
 use tray_icon::menu::MenuId;
 use tray_icon::menu::MenuItem;
+use windows::Win32::UI::WindowsAndMessaging::SPI_SETDESKWALLPAPER;
+use windows::Win32::UI::WindowsAndMessaging::SPIF_SENDCHANGE;
+use windows::Win32::UI::WindowsAndMessaging::SPIF_UPDATEINIFILE;
+use windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
 use winit::application::ApplicationHandler;
 use winit::event_loop::EventLoop;
 
@@ -60,7 +70,7 @@ impl Application {
     fn new_tray_menu(&mut self) -> Menu {
         let menu = Menu::new();
 
-        let menu_item_update = MenuItem::new("立即更新", true, None);
+        let menu_item_update = MenuItem::new("更新壁纸", true, None);
         menu.append(&menu_item_update).unwrap();
         self.menu_item_update = Some(menu_item_update.into_id());
 
@@ -106,7 +116,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::TrayIconEvent(_tray_icon_event) => {}
             UserEvent::MenuEvent(menu_event) => {
                 if &menu_event.id == self.menu_item_update.as_ref().unwrap() {
-                    println!("menu_event: {menu_event:?}");
+                    handle_update_wallpaper();
                     return;
                 }
 
@@ -116,4 +126,77 @@ impl ApplicationHandler<UserEvent> for Application {
             }
         };
     }
+}
+
+#[derive(Deserialize)]
+struct HpImage {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct HpJson {
+    images: Vec<HpImage>,
+}
+
+fn handle_update_wallpaper() {
+    std::thread::spawn(move || {
+        let hp_url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN";
+        let hp_response = match reqwest::blocking::get(hp_url) {
+            Ok(it) => it,
+            Err(_) => return,
+        };
+        let hp_json = match hp_response.json::<HpJson>() {
+            Ok(it) => it,
+            Err(_) => return,
+        };
+        let image_json = match hp_json.images.get(0) {
+            Some(it) => it,
+            None => return,
+        };
+        let image_url = &image_json.url;
+        let image_url = format!("https://s.cn.bing.net{}", image_url);
+        let image_response = match reqwest::blocking::get(&image_url) {
+            Ok(it) => it,
+            Err(_) => return,
+        };
+
+        let to_file = match Builder::new().keep(true).suffix(".jpg").tempfile() {
+            Ok(it) => it,
+            Err(_) => return,
+        };
+        let mut to_file_writer = BufWriter::new(&to_file);
+        let mut image_response_reader = image_response;
+
+        if let Err(_) = copy(&mut image_response_reader, &mut to_file_writer) {
+            return;
+        }
+
+        let to_path = to_file.path().display().to_string();
+        drop(to_file_writer);
+        drop(to_file);
+
+        if let Err(_) = set_wallpaper(&to_path) {
+            return;
+        }
+
+        println!("{:?}", &to_path);
+    });
+}
+
+fn set_wallpaper(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER,
+            0,
+            Some(wide.as_ptr() as _),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )?;
+    }
+
+    Ok(())
 }
