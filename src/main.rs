@@ -5,16 +5,19 @@ use std::ffi::OsStr;
 use std::io::BufWriter;
 use std::io::copy;
 use std::os::windows::ffi::OsStrExt;
+use std::time::Duration;
 use tempfile::Builder;
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
+use tokio::time;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::Menu;
 use tray_icon::menu::MenuEvent;
-use tray_icon::menu::MenuId;
 use tray_icon::menu::MenuItem;
+use tray_icon::menu::PredefinedMenuItem;
 use windows::Win32::UI::WindowsAndMessaging::SPI_SETDESKWALLPAPER;
 use windows::Win32::UI::WindowsAndMessaging::SPIF_SENDCHANGE;
 use windows::Win32::UI::WindowsAndMessaging::SPIF_UPDATEINIFILE;
@@ -48,8 +51,10 @@ enum UserEvent {
 struct Application {
     rt: Runtime,
     tray_icon: Option<TrayIcon>,
-    menu_item_update: Option<MenuId>,
-    menu_item_exit: Option<MenuId>,
+    menu_item_daily_update: Option<MenuItem>,
+    menu_item_update: Option<MenuItem>,
+    menu_item_exit: Option<MenuItem>,
+    daily_updating: Option<JoinHandle<()>>,
 }
 
 impl Application {
@@ -57,8 +62,10 @@ impl Application {
         Application {
             rt: Runtime::new().unwrap(),
             tray_icon: None,
+            menu_item_daily_update: None,
             menu_item_update: None,
             menu_item_exit: None,
+            daily_updating: None,
         }
     }
 
@@ -75,16 +82,19 @@ impl Application {
     fn new_tray_menu(&mut self) -> Menu {
         let menu = Menu::new();
 
-        let menu_item_update_daily = MenuItem::new("✔每日更新壁纸", true, None);
-        menu.append(&menu_item_update_daily).unwrap();
+        let menu_item_daily_update = MenuItem::new("开启每日更新", true, None);
+        menu.append(&menu_item_daily_update).unwrap();
+        self.menu_item_daily_update = Some(menu_item_daily_update);
 
         let menu_item_update = MenuItem::new("更新壁纸", true, None);
         menu.append(&menu_item_update).unwrap();
-        self.menu_item_update = Some(menu_item_update.into_id());
+        self.menu_item_update = Some(menu_item_update);
+
+        menu.append(&PredefinedMenuItem::separator()).unwrap();
 
         let menu_item_exit = MenuItem::new("退出", true, None);
         menu.append(&menu_item_exit).unwrap();
-        self.menu_item_exit = Some(menu_item_exit.into_id());
+        self.menu_item_exit = Some(menu_item_exit);
 
         menu
     }
@@ -124,16 +134,42 @@ impl ApplicationHandler<UserEvent> for Application {
         match event {
             UserEvent::TrayIconEvent(_tray_icon_event) => {}
             UserEvent::MenuEvent(menu_event) => {
-                if &menu_event.id == self.menu_item_update.as_ref().unwrap() {
-                    self.rt.spawn(async {
-                        handle_update_wallpaper().await.unwrap();
-                    });
-                    return;
-                }
-
-                if &menu_event.id == self.menu_item_exit.as_ref().unwrap() {
-                    std::process::exit(0);
-                }
+                match menu_event.id {
+                    _ if menu_event.id == self.menu_item_daily_update.as_ref().unwrap().id() => {
+                        match self.daily_updating.as_ref() {
+                            Some(handle) => {
+                                handle.abort();
+                                self.daily_updating = None;
+                                self.menu_item_daily_update
+                                    .as_ref()
+                                    .unwrap()
+                                    .set_text("开启每日更新");
+                            }
+                            None => {
+                                self.daily_updating = Some(self.rt.spawn(async {
+                                    let mut interval = time::interval(Duration::from_secs(60 * 60));
+                                    loop {
+                                        interval.tick().await;
+                                        handle_update_wallpaper().await.unwrap();
+                                    }
+                                }));
+                                self.menu_item_daily_update
+                                    .as_ref()
+                                    .unwrap()
+                                    .set_text("已开启每日更新");
+                            }
+                        }
+                    }
+                    _ if menu_event.id == self.menu_item_update.as_ref().unwrap().id() => {
+                        self.rt.spawn(async {
+                            handle_update_wallpaper().await.unwrap();
+                        });
+                    }
+                    _ if menu_event.id == self.menu_item_exit.as_ref().unwrap().id() => {
+                        std::process::exit(0);
+                    }
+                    _ => {}
+                };
             }
         };
     }
