@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::SPIF_UPDATEINIFILE;
 use windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
 use winit::application::ApplicationHandler;
 use winit::event_loop::EventLoop;
+use winit::event_loop::EventLoopProxy;
 
 fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
@@ -37,7 +38,7 @@ fn main() {
         proxy.send_event(UserEvent::MenuEvent(event)).unwrap();
     }));
 
-    let mut app = Application::new();
+    let mut app = Application::new(event_loop.create_proxy());
 
     event_loop.run_app(&mut app).unwrap();
 }
@@ -55,10 +56,11 @@ struct Application {
     menu_item_update: Option<MenuItem>,
     menu_item_exit: Option<MenuItem>,
     daily_updating: Option<JoinHandle<()>>,
+    user_event_proxy: EventLoopProxy<UserEvent>,
 }
 
 impl Application {
-    fn new() -> Application {
+    fn new(user_event_proxy: EventLoopProxy<UserEvent>) -> Application {
         Application {
             rt: Runtime::new().unwrap(),
             tray_icon: None,
@@ -66,6 +68,7 @@ impl Application {
             menu_item_update: None,
             menu_item_exit: None,
             daily_updating: None,
+            user_event_proxy,
         }
     }
 
@@ -127,6 +130,12 @@ impl ApplicationHandler<UserEvent> for Application {
     ) {
         if winit::event::StartCause::Init == cause {
             self.tray_icon = Some(Self::new_tray_icon(self));
+            let menu_event = MenuEvent {
+                id: self.menu_item_daily_update.as_ref().unwrap().id().clone(),
+            };
+            self.user_event_proxy
+                .send_event(UserEvent::MenuEvent(menu_event))
+                .unwrap();
         }
     }
 
@@ -206,8 +215,6 @@ async fn handle_update_wallpaper() -> Result<(), Box<dyn Error>> {
     drop(to_file);
 
     set_wallpaper(&to_path)?;
-
-    println!("{:?}", &to_path);
 
     Ok(())
 }
