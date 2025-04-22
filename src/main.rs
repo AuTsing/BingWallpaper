@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use image::GenericImageView;
 use serde::Deserialize;
 use std::error::Error;
