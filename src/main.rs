@@ -1,9 +1,12 @@
+use image::GenericImageView;
 use serde::Deserialize;
+use std::error::Error;
 use std::ffi::OsStr;
 use std::io::BufWriter;
 use std::io::copy;
 use std::os::windows::ffi::OsStrExt;
 use tempfile::Builder;
+use tokio::runtime::Runtime;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
@@ -43,6 +46,7 @@ enum UserEvent {
 }
 
 struct Application {
+    rt: Runtime,
     tray_icon: Option<TrayIcon>,
     menu_item_update: Option<MenuId>,
     menu_item_exit: Option<MenuId>,
@@ -51,6 +55,7 @@ struct Application {
 impl Application {
     fn new() -> Application {
         Application {
+            rt: Runtime::new().unwrap(),
             tray_icon: None,
             menu_item_update: None,
             menu_item_exit: None,
@@ -82,11 +87,12 @@ impl Application {
     }
 
     fn load_icon() -> Icon {
-        Icon::from_path(
-            "D:\\OneDrive\\Gits\\Rust\\BingWallpaper\\assets\\favicon.ico",
-            None,
-        )
-        .unwrap()
+        let icon_bytes = include_bytes!("../assets/favicon.ico");
+        let icon_dyn_image = image::load_from_memory(icon_bytes).unwrap();
+        let rgba = icon_dyn_image.to_rgba8();
+        let (width, height) = icon_dyn_image.dimensions();
+
+        Icon::from_rgba(rgba.into_raw(), width, height).unwrap()
     }
 }
 
@@ -116,7 +122,9 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::TrayIconEvent(_tray_icon_event) => {}
             UserEvent::MenuEvent(menu_event) => {
                 if &menu_event.id == self.menu_item_update.as_ref().unwrap() {
-                    handle_update_wallpaper();
+                    self.rt.spawn(async {
+                        handle_update_wallpaper().await.unwrap();
+                    });
                     return;
                 }
 
@@ -138,52 +146,34 @@ struct HpJson {
     images: Vec<HpImage>,
 }
 
-fn handle_update_wallpaper() {
-    std::thread::spawn(move || {
-        let hp_url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN";
-        let hp_response = match reqwest::blocking::get(hp_url) {
-            Ok(it) => it,
-            Err(_) => return,
-        };
-        let hp_json = match hp_response.json::<HpJson>() {
-            Ok(it) => it,
-            Err(_) => return,
-        };
-        let image_json = match hp_json.images.get(0) {
-            Some(it) => it,
-            None => return,
-        };
-        let image_url = &image_json.url;
-        let image_url = format!("https://s.cn.bing.net{}", image_url);
-        let image_response = match reqwest::blocking::get(&image_url) {
-            Ok(it) => it,
-            Err(_) => return,
-        };
+async fn handle_update_wallpaper() -> Result<(), Box<dyn Error>> {
+    let hp_url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN";
+    let hp_response = reqwest::get(hp_url).await?;
+    let hp_json = hp_response.json::<HpJson>().await?;
+    let image_json = hp_json.images.get(0).ok_or("json is None")?;
+    let image_url = &image_json.url;
+    let image_url = format!("https://s.cn.bing.net{}", &image_url);
+    let image_response = reqwest::get(&image_url).await?;
 
-        let to_file = match Builder::new().keep(true).suffix(".jpg").tempfile() {
-            Ok(it) => it,
-            Err(_) => return,
-        };
-        let mut to_file_writer = BufWriter::new(&to_file);
-        let mut image_response_reader = image_response;
+    let to_file = Builder::new().keep(true).suffix(".jpg").tempfile()?;
+    let mut to_file_writer = BufWriter::new(&to_file);
+    let image_response_bytes = image_response.bytes().await?;
+    let mut image_response_reader = image_response_bytes.as_ref();
 
-        if let Err(_) = copy(&mut image_response_reader, &mut to_file_writer) {
-            return;
-        }
+    copy(&mut image_response_reader, &mut to_file_writer)?;
 
-        let to_path = to_file.path().display().to_string();
-        drop(to_file_writer);
-        drop(to_file);
+    let to_path = to_file.path().display().to_string();
+    drop(to_file_writer);
+    drop(to_file);
 
-        if let Err(_) = set_wallpaper(&to_path) {
-            return;
-        }
+    set_wallpaper(&to_path)?;
 
-        println!("{:?}", &to_path);
-    });
+    println!("{:?}", &to_path);
+
+    Ok(())
 }
 
-fn set_wallpaper(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn set_wallpaper(path: &str) -> Result<(), Box<dyn Error>> {
     let wide: Vec<u16> = OsStr::new(path)
         .encode_wide()
         .chain(std::iter::once(0))
