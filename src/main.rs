@@ -75,6 +75,9 @@ impl Application {
     fn new_tray_menu(&mut self) -> Menu {
         let menu = Menu::new();
 
+        let menu_item_update_daily = MenuItem::new("✔每日更新壁纸", true, None);
+        menu.append(&menu_item_update_daily).unwrap();
+
         let menu_item_update = MenuItem::new("更新壁纸", true, None);
         menu.append(&menu_item_update).unwrap();
         self.menu_item_update = Some(menu_item_update.into_id());
