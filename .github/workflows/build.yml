@@ -1,0 +1,46 @@
+name: build
+
+on:
+    push:
+        tags:
+            - 'v*.*.*'
+
+jobs:
+    build:
+        runs-on: windows-2022
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Setup rust
+              uses: dsherret/rust-toolchain-file@v1
+
+            - name: Build
+              run: |
+                  cargo build --release --locked
+
+            - name: Zip
+              shell: pwsh
+              run: |
+                  Compress-Archive -CompressionLevel Optimal -Force -Path target/release/BingWallpaper.exe -DestinationPath target/release/BingWallpaper.zip
+
+            - name: Get tag name
+              id: tag_name
+              shell: pwsh
+              run: |
+                  echo "version=$(echo ${GITHUB_REF#refs/tags/v})" >> $GITHUB_OUTPUT
+
+            - name: Read changelog
+              id: changelog
+              uses: mindsers/changelog-reader-action@v2
+              with:
+                  version: ${{ steps.tag_name.outputs.version }}
+
+            - name: Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: target/release/BingWallpaper.zip
+                  body: |
+                      ### ${{ steps.changelog.outputs.version }} / ${{ steps.changelog.outputs.date }}
+
+                      ${{ steps.changelog.outputs.changes }}
