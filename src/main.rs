@@ -14,6 +14,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tracing::info;
+use tracing_appender::non_blocking;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
@@ -31,6 +33,13 @@ use winit::event_loop::EventLoop;
 use winit::event_loop::EventLoopProxy;
 
 fn main() {
+    let log_file = Builder::new().keep(true).suffix(".log").tempfile().unwrap();
+    let (non_blocking, _guard) = non_blocking(log_file);
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(non_blocking)
+        .init();
+
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
 
     let proxy = event_loop.create_proxy();
@@ -61,7 +70,7 @@ struct Application {
     menu_item_exit: Option<MenuItem>,
     daily_updating: Option<JoinHandle<()>>,
     user_event_proxy: EventLoopProxy<UserEvent>,
-    last_updated_url: Arc<Mutex<Option<String>>>,
+    last_updated_url: Arc<Mutex<String>>,
 }
 
 impl Application {
@@ -74,7 +83,7 @@ impl Application {
             menu_item_exit: None,
             daily_updating: None,
             user_event_proxy,
-            last_updated_url: Arc::new(Mutex::new(None)),
+            last_updated_url: Arc::new(Mutex::new("".to_string())),
         }
     }
 
@@ -161,16 +170,9 @@ impl ApplicationHandler<UserEvent> for Application {
                                     .set_text("开启每日更新");
                             }
                             None => {
-                                let last_updated_url = Arc::clone(&self.last_updated_url);
-                                self.daily_updating = Some(self.rt.spawn(async move {
-                                    let mut interval = time::interval(Duration::from_secs(60 * 60));
-                                    loop {
-                                        interval.tick().await;
-                                        handle_update_wallpaper(last_updated_url.clone())
-                                            .await
-                                            .unwrap();
-                                    }
-                                }));
+                                self.daily_updating = Some(self.rt.spawn(
+                                    handle_enable_daily_updating(self.last_updated_url.clone()),
+                                ));
                                 self.menu_item_daily_update
                                     .as_ref()
                                     .unwrap()
@@ -179,10 +181,8 @@ impl ApplicationHandler<UserEvent> for Application {
                         }
                     }
                     _ if menu_event.id == self.menu_item_update.as_ref().unwrap().id() => {
-                        let last_updated_url = Arc::clone(&self.last_updated_url);
-                        self.rt.spawn(async move {
-                            handle_update_wallpaper(last_updated_url).await.unwrap();
-                        });
+                        self.rt
+                            .spawn(handle_update_wallpaper(self.last_updated_url.clone()));
                     }
                     _ if menu_event.id == self.menu_item_exit.as_ref().unwrap().id() => {
                         std::process::exit(0);
@@ -204,23 +204,57 @@ struct HpJson {
     images: Vec<HpImage>,
 }
 
-async fn handle_update_wallpaper(
-    last_updated_url: Arc<Mutex<Option<String>>>,
-) -> Result<(), Box<dyn Error>> {
+async fn handle_enable_daily_updating(last_updated_url: Arc<Mutex<String>>) {
+    let mut interval = time::interval(Duration::from_secs(60 * 60));
+    loop {
+        interval.tick().await;
+        handle_update_wallpaper(last_updated_url.clone()).await;
+    }
+}
+
+async fn handle_update_wallpaper(last_updated_url: Arc<Mutex<String>>) {
+    info!("开始更新壁纸");
+
+    let latest_image_url = get_latest_image_url().await.unwrap();
+
+    if !check_needed_update(last_updated_url.clone(), &latest_image_url).await {
+        return;
+    }
+
+    let latest_image_path = download_wallpaper(&latest_image_url).await.unwrap();
+    set_wallpaper(&latest_image_path).unwrap();
+}
+
+async fn get_latest_image_url() -> Result<String, Box<dyn Error>> {
     let hp_url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN";
     let hp_response = reqwest::get(hp_url).await?;
     let hp_json = hp_response.json::<HpJson>().await?;
     let image_json = hp_json.images.get(0).ok_or("json is None")?;
     let image_url = &image_json.url;
 
-    let mut last_updated_url = last_updated_url.lock().await;
-    if last_updated_url.as_deref() == Some(image_url) {
-        return Ok(());
-    }
-    *last_updated_url = Some(image_url.clone());
-    drop(last_updated_url);
+    info!("更新链接: {}", image_url);
 
-    let image_url = format!("https://s.cn.bing.net{}", &image_url);
+    Ok(image_url.clone())
+}
+
+async fn check_needed_update(
+    last_updated_url: Arc<Mutex<String>>,
+    latest_image_url: &String,
+) -> bool {
+    let mut last_updated_url = last_updated_url.lock().await;
+    if &*last_updated_url == latest_image_url {
+        info!("更新链接相同，跳过更新");
+        false
+    } else {
+        *last_updated_url = latest_image_url.clone();
+        true
+    }
+}
+
+async fn download_wallpaper(latest_image_url: &String) -> Result<String, Box<dyn Error>> {
+    info!("下载壁纸");
+
+    let image_url = format!("https://s.cn.bing.net{}", latest_image_url);
     let image_response = reqwest::get(&image_url).await?;
 
     let to_file = Builder::new().keep(true).suffix(".jpg").tempfile()?;
@@ -231,15 +265,15 @@ async fn handle_update_wallpaper(
     copy(&mut image_response_reader, &mut to_file_writer)?;
 
     let to_path = to_file.path().display().to_string();
-    drop(to_file_writer);
-    drop(to_file);
 
-    set_wallpaper(&to_path)?;
+    info!("保存壁纸: {}", &to_path);
 
-    Ok(())
+    Ok(to_path)
 }
 
-fn set_wallpaper(path: &str) -> Result<(), Box<dyn Error>> {
+fn set_wallpaper(path: &String) -> Result<(), Box<dyn Error>> {
+    info!("应用壁纸");
+
     let wide: Vec<u16> = OsStr::new(path)
         .encode_wide()
         .chain(std::iter::once(0))
