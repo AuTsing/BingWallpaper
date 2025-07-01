@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use ::time::format_description;
 use image::GenericImageView;
 use serde::Deserialize;
 use std::error::Error;
@@ -14,8 +15,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tokio::time::MissedTickBehavior;
 use tracing::info;
 use tracing_appender::non_blocking;
+use tracing_subscriber::fmt::time::LocalTime;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
@@ -35,8 +38,15 @@ use winit::event_loop::EventLoopProxy;
 fn main() {
     let log_file = Builder::new().keep(true).suffix(".log").tempfile().unwrap();
     let (non_blocking, _guard) = non_blocking(log_file);
+    let time_fmt = format_description::parse(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]",
+    )
+    .unwrap();
+    let timer = LocalTime::new(time_fmt);
     tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_timer(timer)
+        .with_target(false)
         .with_writer(non_blocking)
         .init();
 
@@ -206,6 +216,7 @@ struct HpJson {
 
 async fn handle_enable_daily_updating(last_updated_url: Arc<Mutex<String>>) {
     let mut interval = time::interval(Duration::from_secs(60 * 60));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         handle_update_wallpaper(last_updated_url.clone()).await;
