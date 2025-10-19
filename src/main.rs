@@ -2,6 +2,7 @@
 
 use ::time::format_description;
 use image::GenericImageView;
+use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -36,7 +37,11 @@ use winit::event_loop::EventLoop;
 use winit::event_loop::EventLoopProxy;
 
 fn main() {
-    let log_file = Builder::new().keep(true).suffix(".log").tempfile().unwrap();
+    let log_file = Builder::new()
+        .disable_cleanup(true)
+        .suffix(".log")
+        .tempfile()
+        .unwrap();
     let (non_blocking, _guard) = non_blocking(log_file);
     let time_fmt = format_description::parse(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]",
@@ -61,7 +66,12 @@ fn main() {
         proxy.send_event(UserEvent::MenuEvent(event)).unwrap();
     }));
 
-    let mut app = Application::new(event_loop.create_proxy());
+    let reqwest_client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let mut app = Application::new(event_loop.create_proxy(), reqwest_client);
 
     event_loop.run_app(&mut app).unwrap();
 }
@@ -80,11 +90,12 @@ struct Application {
     menu_item_exit: Option<MenuItem>,
     daily_updating: Option<JoinHandle<()>>,
     user_event_proxy: EventLoopProxy<UserEvent>,
+    reqwest_client: Client,
     last_updated_url: Arc<Mutex<String>>,
 }
 
 impl Application {
-    fn new(user_event_proxy: EventLoopProxy<UserEvent>) -> Application {
+    fn new(user_event_proxy: EventLoopProxy<UserEvent>, reqwest_client: Client) -> Application {
         Application {
             rt: Runtime::new().unwrap(),
             tray_icon: None,
@@ -93,6 +104,7 @@ impl Application {
             menu_item_exit: None,
             daily_updating: None,
             user_event_proxy,
+            reqwest_client,
             last_updated_url: Arc::new(Mutex::new("".to_string())),
         }
     }
@@ -180,9 +192,11 @@ impl ApplicationHandler<UserEvent> for Application {
                                     .set_text("开启每日更新");
                             }
                             None => {
-                                self.daily_updating = Some(self.rt.spawn(
-                                    handle_enable_daily_updating(self.last_updated_url.clone()),
-                                ));
+                                self.daily_updating =
+                                    Some(self.rt.spawn(handle_enable_daily_updating(
+                                        self.reqwest_client.clone(),
+                                        self.last_updated_url.clone(),
+                                    )));
                                 self.menu_item_daily_update
                                     .as_ref()
                                     .unwrap()
@@ -191,8 +205,10 @@ impl ApplicationHandler<UserEvent> for Application {
                         }
                     }
                     _ if menu_event.id == self.menu_item_update.as_ref().unwrap().id() => {
-                        self.rt
-                            .spawn(handle_update_wallpaper(self.last_updated_url.clone()));
+                        self.rt.spawn(handle_update_wallpaper(
+                            self.reqwest_client.clone(),
+                            self.last_updated_url.clone(),
+                        ));
                     }
                     _ if menu_event.id == self.menu_item_exit.as_ref().unwrap().id() => {
                         std::process::exit(0);
@@ -214,31 +230,33 @@ struct HpJson {
     images: Vec<HpImage>,
 }
 
-async fn handle_enable_daily_updating(last_updated_url: Arc<Mutex<String>>) {
+async fn handle_enable_daily_updating(client: Client, last_updated_url: Arc<Mutex<String>>) {
     let mut interval = time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        handle_update_wallpaper(last_updated_url.clone()).await;
+        handle_update_wallpaper(client.clone(), last_updated_url.clone()).await;
     }
 }
 
-async fn handle_update_wallpaper(last_updated_url: Arc<Mutex<String>>) {
+async fn handle_update_wallpaper(client: Client, last_updated_url: Arc<Mutex<String>>) {
     info!("开始更新壁纸");
 
-    let latest_image_url = get_latest_image_url().await.unwrap();
+    let latest_image_url = get_latest_image_url(&client).await.unwrap();
 
-    if !check_needed_update(last_updated_url.clone(), &latest_image_url).await {
+    if !check_needed_update(last_updated_url, &latest_image_url).await {
         return;
     }
 
-    let latest_image_path = download_wallpaper(&latest_image_url).await.unwrap();
+    let latest_image_path = download_wallpaper(&client, &latest_image_url)
+        .await
+        .unwrap();
     set_wallpaper(&latest_image_path).unwrap();
 }
 
-async fn get_latest_image_url() -> Result<String, Box<dyn Error>> {
+async fn get_latest_image_url(client: &Client) -> Result<String, Box<dyn Error>> {
     let hp_url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN";
-    let hp_response = reqwest::get(hp_url).await?;
+    let hp_response = client.get(hp_url).send().await?;
     let hp_json = hp_response.json::<HpJson>().await?;
     let image_json = hp_json.images.get(0).ok_or("json is None")?;
     let image_url = &image_json.url;
@@ -253,22 +271,28 @@ async fn check_needed_update(
     latest_image_url: &String,
 ) -> bool {
     let mut last_updated_url = last_updated_url.lock().await;
-    if &*last_updated_url == latest_image_url {
+    if *&latest_image_url == latest_image_url {
         info!("更新链接相同，跳过更新");
-        false
-    } else {
-        *last_updated_url = latest_image_url.clone();
-        true
+        return false;
     }
+
+    *last_updated_url = latest_image_url.clone();
+    true
 }
 
-async fn download_wallpaper(latest_image_url: &String) -> Result<String, Box<dyn Error>> {
+async fn download_wallpaper(
+    client: &Client,
+    latest_image_url: &String,
+) -> Result<String, Box<dyn Error>> {
     info!("下载壁纸");
 
     let image_url = format!("https://s.cn.bing.net{}", latest_image_url);
-    let image_response = reqwest::get(&image_url).await?;
+    let image_response = client.get(&image_url).send().await?;
 
-    let to_file = Builder::new().keep(true).suffix(".jpg").tempfile()?;
+    let to_file = Builder::new()
+        .disable_cleanup(true)
+        .suffix(".jpg")
+        .tempfile()?;
     let mut to_file_writer = BufWriter::new(&to_file);
     let image_response_bytes = image_response.bytes().await?;
     let mut image_response_reader = image_response_bytes.as_ref();
