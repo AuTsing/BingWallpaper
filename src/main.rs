@@ -271,7 +271,7 @@ async fn check_needed_update(
     latest_image_url: &String,
 ) -> bool {
     let mut last_updated_url = last_updated_url.lock().await;
-    if *&latest_image_url == latest_image_url {
+    if &*last_updated_url == latest_image_url {
         info!("更新链接相同，跳过更新");
         return false;
     }
