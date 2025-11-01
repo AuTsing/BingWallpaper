@@ -67,9 +67,10 @@ fn main() {
     }));
 
     let reqwest_client = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .pool_idle_timeout(Duration::from_secs(3))
+        .pool_idle_timeout(Duration::ZERO)
         .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(3))
+        .connect_timeout(Duration::from_secs(3))
         .build()
         .unwrap();
 
