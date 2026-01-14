@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use ::time::format_description;
+use anyhow::Result;
 use image::GenericImageView;
 use reqwest::Client;
 use serde::Deserialize;
@@ -17,6 +18,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
+use tracing::error;
 use tracing::info;
 use tracing_appender::non_blocking;
 use tracing_subscriber::fmt::time::LocalTime;
@@ -36,17 +38,42 @@ use winit::application::ApplicationHandler;
 use winit::event_loop::EventLoop;
 use winit::event_loop::EventLoopProxy;
 
-fn main() {
+fn main() -> Result<()> {
+    setup_logger()?;
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if let Err(e) = proxy.send_event(UserEvent::TrayIconEvent(event)) {
+            error!("Event handle error: {:?}", e);
+        }
+    }));
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        if let Err(e) = proxy.send_event(UserEvent::MenuEvent(event)) {
+            error!("Event handle error: {:?}", e);
+        }
+    }));
+
+    let proxy = event_loop.create_proxy();
+
+    let mut app = Application::new(proxy)?;
+
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
+}
+
+fn setup_logger() -> Result<()> {
     let log_file = Builder::new()
         .disable_cleanup(true)
         .suffix(".log")
-        .tempfile()
-        .unwrap();
+        .tempfile()?;
     let (non_blocking, _guard) = non_blocking(log_file);
     let time_fmt = format_description::parse(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]",
-    )
-    .unwrap();
+    )?;
     let timer = LocalTime::new(time_fmt);
     tracing_subscriber::fmt()
         .with_ansi(false)
@@ -55,28 +82,7 @@ fn main() {
         .with_writer(non_blocking)
         .init();
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
-
-    let proxy = event_loop.create_proxy();
-    TrayIconEvent::set_event_handler(Some(move |event| {
-        proxy.send_event(UserEvent::TrayIconEvent(event)).unwrap();
-    }));
-    let proxy = event_loop.create_proxy();
-    MenuEvent::set_event_handler(Some(move |event| {
-        proxy.send_event(UserEvent::MenuEvent(event)).unwrap();
-    }));
-
-    let reqwest_client = Client::builder()
-        .pool_idle_timeout(Duration::ZERO)
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(3))
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-
-    let mut app = Application::new(event_loop.create_proxy(), reqwest_client);
-
-    event_loop.run_app(&mut app).unwrap();
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -87,10 +93,10 @@ enum UserEvent {
 
 struct Application {
     rt: Runtime,
-    tray_icon: Option<TrayIcon>,
-    menu_item_daily_update: Option<MenuItem>,
-    menu_item_update: Option<MenuItem>,
-    menu_item_exit: Option<MenuItem>,
+    _tray_icon: TrayIcon,
+    menu_item_daily_update: MenuItem,
+    menu_item_update: MenuItem,
+    menu_item_exit: MenuItem,
     daily_updating: Option<JoinHandle<()>>,
     user_event_proxy: EventLoopProxy<UserEvent>,
     reqwest_client: Client,
@@ -98,57 +104,69 @@ struct Application {
 }
 
 impl Application {
-    fn new(user_event_proxy: EventLoopProxy<UserEvent>, reqwest_client: Client) -> Application {
-        Application {
-            rt: Runtime::new().unwrap(),
-            tray_icon: None,
-            menu_item_daily_update: None,
-            menu_item_update: None,
-            menu_item_exit: None,
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
+        let rt = Runtime::new()?;
+        let client = Client::builder()
+            .pool_idle_timeout(Duration::ZERO)
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(3))
+            .connect_timeout(Duration::from_secs(3))
+            .build()?;
+        let menu_item_daily_update = MenuItem::new("开启每日更新", true, None);
+        let menu_item_update = MenuItem::new("更新壁纸", true, None);
+        let menu_item_exit = MenuItem::new("退出", true, None);
+        let tray_menu =
+            Self::new_tray_menu(&menu_item_daily_update, &menu_item_update, &menu_item_exit)?;
+        let tray_icon = Self::new_tray_icon(tray_menu)?;
+
+        Ok(Self {
+            rt,
+            _tray_icon: tray_icon,
+            menu_item_daily_update,
+            menu_item_update,
+            menu_item_exit,
             daily_updating: None,
-            user_event_proxy,
-            reqwest_client,
+            user_event_proxy: proxy,
+            reqwest_client: client,
             last_updated_url: Arc::new(Mutex::new("".to_string())),
-        }
+        })
     }
 
-    fn new_tray_icon(&mut self) -> TrayIcon {
-        TrayIconBuilder::new()
-            .with_menu(Box::new(Self::new_tray_menu(self)))
+    fn new_tray_icon(tray_menu: Menu) -> Result<TrayIcon> {
+        let icon = Self::load_icon()?;
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(tray_menu))
             .with_tooltip("BingWallpaper")
-            .with_icon(Self::load_icon())
+            .with_icon(icon)
             .with_title("x")
-            .build()
-            .unwrap()
+            .build()?;
+
+        Ok(tray_icon)
     }
 
-    fn new_tray_menu(&mut self) -> Menu {
+    fn new_tray_menu(
+        menu_item_daily_update: &MenuItem,
+        menu_item_update: &MenuItem,
+        menu_item_exit: &MenuItem,
+    ) -> Result<Menu> {
         let menu = Menu::new();
 
-        let menu_item_daily_update = MenuItem::new("开启每日更新", true, None);
-        menu.append(&menu_item_daily_update).unwrap();
-        self.menu_item_daily_update = Some(menu_item_daily_update);
+        menu.append(menu_item_daily_update)?;
+        menu.append(menu_item_update)?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(menu_item_exit)?;
 
-        let menu_item_update = MenuItem::new("更新壁纸", true, None);
-        menu.append(&menu_item_update).unwrap();
-        self.menu_item_update = Some(menu_item_update);
-
-        menu.append(&PredefinedMenuItem::separator()).unwrap();
-
-        let menu_item_exit = MenuItem::new("退出", true, None);
-        menu.append(&menu_item_exit).unwrap();
-        self.menu_item_exit = Some(menu_item_exit);
-
-        menu
+        Ok(menu)
     }
 
-    fn load_icon() -> Icon {
+    fn load_icon() -> Result<Icon> {
         let icon_bytes = include_bytes!("../assets/favicon.ico");
-        let icon_dyn_image = image::load_from_memory(icon_bytes).unwrap();
+        let icon_dyn_image = image::load_from_memory(icon_bytes)?;
         let rgba = icon_dyn_image.to_rgba8();
         let (width, height) = icon_dyn_image.dimensions();
 
-        Icon::from_rgba(rgba.into_raw(), width, height).unwrap()
+        Ok(Icon::from_rgba(rgba.into_raw(), width, height)?)
     }
 }
 
@@ -169,13 +187,15 @@ impl ApplicationHandler<UserEvent> for Application {
         cause: winit::event::StartCause,
     ) {
         if winit::event::StartCause::Init == cause {
-            self.tray_icon = Some(Self::new_tray_icon(self));
             let menu_event = MenuEvent {
-                id: self.menu_item_daily_update.as_ref().unwrap().id().clone(),
+                id: self.menu_item_daily_update.id().clone(),
             };
-            self.user_event_proxy
+            if let Err(e) = self
+                .user_event_proxy
                 .send_event(UserEvent::MenuEvent(menu_event))
-                .unwrap();
+            {
+                error!("Event handle error: {:?}", e);
+            }
         }
     }
 
@@ -183,41 +203,34 @@ impl ApplicationHandler<UserEvent> for Application {
         match event {
             UserEvent::TrayIconEvent(_tray_icon_event) => {}
             UserEvent::MenuEvent(menu_event) => {
-                match menu_event.id {
-                    _ if menu_event.id == self.menu_item_daily_update.as_ref().unwrap().id() => {
-                        match self.daily_updating.as_ref() {
-                            Some(handle) => {
-                                handle.abort();
-                                self.daily_updating = None;
-                                self.menu_item_daily_update
-                                    .as_ref()
-                                    .unwrap()
-                                    .set_text("开启每日更新");
-                            }
-                            None => {
-                                self.daily_updating =
-                                    Some(self.rt.spawn(handle_enable_daily_updating(
-                                        self.reqwest_client.clone(),
-                                        self.last_updated_url.clone(),
-                                    )));
-                                self.menu_item_daily_update
-                                    .as_ref()
-                                    .unwrap()
-                                    .set_text("已开启每日更新");
-                            }
+                if menu_event.id == self.menu_item_daily_update.id() {
+                    match &self.daily_updating {
+                        Some(join_handle) => {
+                            join_handle.abort();
+                            self.daily_updating = None;
+                            self.menu_item_daily_update.set_text("开启每日更新");
+                        }
+                        None => {
+                            self.daily_updating =
+                                Some(self.rt.spawn(handle_enable_daily_updating(
+                                    self.reqwest_client.clone(),
+                                    self.last_updated_url.clone(),
+                                )));
+                            self.menu_item_daily_update.set_text("已开启每日更新");
                         }
                     }
-                    _ if menu_event.id == self.menu_item_update.as_ref().unwrap().id() => {
-                        self.rt.spawn(handle_update_wallpaper(
-                            self.reqwest_client.clone(),
-                            self.last_updated_url.clone(),
-                        ));
-                    }
-                    _ if menu_event.id == self.menu_item_exit.as_ref().unwrap().id() => {
-                        std::process::exit(0);
-                    }
-                    _ => {}
-                };
+                }
+
+                if menu_event.id == self.menu_item_update.id() {
+                    self.rt.spawn(handle_update_wallpaper(
+                        self.reqwest_client.clone(),
+                        self.last_updated_url.clone(),
+                    ));
+                }
+
+                if menu_event.id == self.menu_item_exit.id() {
+                    std::process::exit(0);
+                }
             }
         };
     }
@@ -243,18 +256,28 @@ async fn handle_enable_daily_updating(client: Client, last_updated_url: Arc<Mute
 }
 
 async fn handle_update_wallpaper(client: Client, last_updated_url: Arc<Mutex<String>>) {
+    if let Err(e) = update_wallpaper(client, last_updated_url).await {
+        error!("更新壁纸失败: {:?}", e);
+    };
+}
+
+async fn update_wallpaper(
+    client: Client,
+    last_updated_url: Arc<Mutex<String>>,
+) -> Result<(), Box<dyn Error>> {
     info!("开始更新壁纸");
 
-    let latest_image_url = get_latest_image_url(&client).await.unwrap();
+    let latest_image_url = get_latest_image_url(&client).await?;
 
     if !check_needed_update(last_updated_url, &latest_image_url).await {
-        return;
+        return Ok(());
     }
 
-    let latest_image_path = download_wallpaper(&client, &latest_image_url)
-        .await
-        .unwrap();
-    set_wallpaper(&latest_image_path).unwrap();
+    let latest_image_path = download_wallpaper(&client, &latest_image_url).await?;
+
+    set_wallpaper(&latest_image_path)?;
+
+    Ok(())
 }
 
 async fn get_latest_image_url(client: &Client) -> Result<String, Box<dyn Error>> {
