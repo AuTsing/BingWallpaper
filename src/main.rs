@@ -21,6 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::error;
 use tracing::info;
 use tracing_appender::non_blocking;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::time::LocalTime;
 use tray_icon::Icon;
 use tray_icon::TrayIcon;
@@ -39,7 +40,7 @@ use winit::event_loop::EventLoop;
 use winit::event_loop::EventLoopProxy;
 
 fn main() -> Result<()> {
-    setup_logger()?;
+    let _guard = setup_logger()?;
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
 
@@ -65,12 +66,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn setup_logger() -> Result<()> {
+fn setup_logger() -> Result<WorkerGuard> {
     let log_file = Builder::new()
         .disable_cleanup(true)
         .suffix(".log")
         .tempfile()?;
-    let (non_blocking, _guard) = non_blocking(log_file);
+    let (non_blocking, guard) = non_blocking(log_file);
     let time_fmt = format_description::parse(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]",
     )?;
@@ -82,7 +83,7 @@ fn setup_logger() -> Result<()> {
         .with_writer(non_blocking)
         .init();
 
-    Ok(())
+    Ok(guard)
 }
 
 #[derive(Debug)]
